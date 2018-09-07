@@ -1,0 +1,90 @@
+################################################################################################################
+# Wrapper for cytofkit
+# Purpose: clustering of cytof data based on customisable marker selection
+# Output: Rdata object containing dataframe of dimensionality reduced data and cluster annotations
+# 	  png of tSNE with phenograph and clusterX clustering
+################################################################################################################
+
+### packages
+stopifnot(
+	require(cytofkit),
+	require(gridExtra),
+	require(grid),
+	require(ggplot2),
+	require(lattice),
+	require(stringr),
+	require(Rtsne),
+	require(optparse)
+	)
+
+### command line args
+option_list <- list(
+	    make_option(c("--infile", "-i"), default=NULL, help="FCS file"),
+	    make_option(c("--out_norm"), default=NULL, help="RData file - normalised data"),
+   	    make_option(c("--out_tsne"), default=NULL, help="RData file - tSNE data"),	
+	    make_option(c("--markers", "-m"), default=NULL, help="Comma seperated list of markers (in caps)"),
+	    make_option(c("--perplexity"), default=30, help="perplexity value for tSNE"),
+	    make_option(c("--iterations"), default=1000, help="tSNE iterations"),
+	    make_option(c("--dataTransform"), default="cytofAsinh", help="Data transformation method: cytofAsinh, arcsinh, or none"),
+	    make_option(c("--no_events"), default=90000, help="No. of events to sample from each sample. Default=90,000, for all set as 'all' ")
+	    )
+
+opt <- parse_args(OptionParser(option_list=option_list))
+
+# import data from FCS file
+print(opt$infile)
+print(opt$perplexity)
+
+mat <- cytof_exprsExtract(fcsFile=opt$infile, comp=FALSE, transformMethod=opt$dataTransform) # fine for 1 file
+
+# ### merging from multiple donors (need to support 2/3)
+# need to support handling of single infile as or list of files
+# df <- cytof_exprsMerge(opt$files, comp=FALSE, transform=opt$dataTransform)
+
+# get_donor_id <- function(x){
+#     d_id <- str_split(x, "\\.", simplify=TRUE)[1]
+#     return(d_id)	 
+# }
+
+# df$donor_id <- sapply(rownames(df), get_donor_id) # donor_id col can be used for identification of event source downstream
+
+
+mat <- as.data.frame(mat)
+
+subsample <- sample(1:nrow(mat), opt$no_events)
+mat <- mat[subsample, ]
+
+# now remove markers used for gating & any redundant markers
+print(head(mat))
+
+names <- str_split(names(mat), "_", simplify=T)[, 2] # first rename cols
+names <- str_replace(names, ">", "")
+colnames(mat) <- str_to_upper(names)
+clust_markers = strsplit(opt$markers, ",")[[1]] # get markers for clustering as vector
+print(str(clust_markers))
+mat <- mat[clust_markers] # subset data
+
+# remove any duplicate rows before running tSNE
+dups <- duplicated(mat)
+mat <- mat[!dups, ]
+
+#tSNE
+# ma_tsne <- cytof_dimReduction(data=mat, method = "tsne")
+
+mat_tsne_out <- Rtsne(mat,
+		      initial_dims=ncol(mat),
+		      dims=2,
+		      pca=TRUE,
+		      check_duplicates=FALSE,
+		      perplexity=as.numeric(opt$perplexity),
+		      max_iter=as.numeric(opt$iterations))
+
+mat_tsne <- mat
+mat_tsne$tsne_1 <- mat_tsne_out$Y[,1]
+mat_tsne$tsne_2 <- mat_tsne_out$Y[,2]
+mat_tsne$perplexity <- opt$perplexity
+mat_tsne$iterations <- opt$iterations
+
+# save Rdata file
+saveRDS(mat_tsne, opt$out_tsne)
+saveRDS(mat, opt$out_norm)
