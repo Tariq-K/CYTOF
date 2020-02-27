@@ -71,10 +71,13 @@ import sys
 import os
 import sqlite3
 import CGAT.Experiment as E
+import CGAT.Database as DB
 import CGATPipelines.Pipeline as P
 import rpy2.robjects as ro
 import CGAT.IOTools as IOTools
 import glob
+import pandas as pd
+from functools import reduce
 
 # load options from the config file
 PARAMS = P.getParameters(
@@ -127,7 +130,17 @@ def connect():
 
 # ---------------------------------------------------
 # Specific pipeline task
-def run_tsne_generator():
+
+# Currently data is processed & normalised using cytofkit & tSNE is run on that data in 1 step
+# this creates duplicates of processed data for each tSNE run. This is not neccessary as most clustering
+# methods use high dimensional data. tSNE is just for visualisation.
+
+# TODO
+# 1) Split data processing & normalisation into a seperate task
+# 2) Run tNSE on processed data and set a "default" tSNE setting which can be altered in pipeline.ini,
+#    or tweaked after the pipeline has run
+
+def Rgenerator():
     '''Group FCS files by sample, supports n replicates'''
     
     files = glob.glob("data.dir/*FCS")
@@ -151,44 +164,79 @@ def run_tsne_generator():
 
     for key in group_dict.keys():
         infiles = group_dict[key]
-        outfile = os.path.basename(key) + ".matrix.touch"
+        outfile = "data.dir/" + os.path.basename(key) + ".norm.txt"
 
         yield([infiles, outfile])
-        
-   
-@files(run_tsne_generator)
-def run_tsne(infiles, outfile):
-    '''Process FCS data and run tSNE. Supports multiple options for 
+
+@files(Rgenerator)
+def normaliseFCS(infiles, outfile):
+    '''Normalise FCS data with cytofkit. Subset data to panel specified in pipeline.ini'''
+
+    infiles = ','.join(infiles)
+    pipeline_dir = PARAMS["pipeline_dir"]
+
+    marker_list = PARAMS["analysis_panel"] # list of all markers in panel
+    events = PARAMS["analysis_no_events"] # no events per sample
+    transform = PARAMS["analysis_transform"]
+    
+    statement = '''Rscript %(pipeline_dir)sR/cytofkit_new.R 
+                    --infiles %(infiles)s
+                    --outfile %(outfile)s
+                    --dataTransform %(transform)s
+                    --markers %(marker_list)s
+                    --no_events %(events)s'''
+    print(statement)
+
+    P.run()                  
+
+
+@transform(normaliseFCS,
+           suffix(r".txt"),
+           r".load")
+def loadNormaliseFCS(infile, outfile):
+
+    tablename = os.path.basename(outfile).replace(".load", "").replace(".", "_")
+
+    cols = 'id,' + PARAMS["analysis_panel"]
+    options='-H "%(cols)s" ' % locals()
+
+    statement = '''tail -n +2 %(infile)s | ''' + P.build_load_statement(tablename, options=options, retry=True) + ''' > %(outfile)s'''
+
+    print(statement)
+    
+    to_cluster = True
+
+    P.run() 
+    
+@follows(normaliseFCS, mkdir("tSNE.dir"))
+@transform(normaliseFCS,
+           regex(r"data.dir/(.*).norm.txt"),
+           r"tSNE.dir/\1.tsne.touch")
+def runTsne(infile, outfile):
+    '''Run tSNE. Supports multiple options for 
        tsne parameters "perplexity" and "iterations" '''
 
     job_memory = "40G"
     pipeline_dir = PARAMS["pipeline_dir"]
     
-    infiles = ','.join(infiles)
-
-    marker_list = PARAMS["analysis_markers"] # markers to use for tsne & downstream analysis
+    marker_list = PARAMS["tsne_markers"] # markers to use for tsne & downstream analysis
     perplexity = str(PARAMS["tsne_perplexity"]).split(",")
     iterations = str(PARAMS["tsne_iterations"]).split(",")
-    events = PARAMS["analysis_no_events"] # no events per sample
     
     statements = []
 
     for p in perplexity:
         for i in iterations:
-
-            out_norm = outfile.replace(".matrix.touch", "") + "." + str(p) + "_" + str(i) + ".norm.RData"
-            out_tsne = outfile.replace(".matrix.touch", "") + "." + str(p) + "_" + str(i) + ".tsne.RData"
+            out_tsne = outfile.replace(".tsne.touch", "") + "." + str(p) + "_" + str(i) + ".tsne.txt"
             log = outfile.replace(".touch", ".log")
         
-            statements.append('''Rscript %(pipeline_dir)s/R/cytofkit.R 
-                                   --infiles %(infiles)s 
-                                   --out_norm %(out_norm)s 
-                                   --out_tsne %(out_tsne)s
+            statements.append('''Rscript %(pipeline_dir)sR/tsne.R 
+                                   --infile %(infile)s 
+                                   --outfile %(out_tsne)s
                                    --markers %(marker_list)s                                    
                                    --perplexity %(p)s 
                                    --iterations %(i)s
-                                   --no_events %(events)s
-                                   &> %(log)s''' % locals() )
+                                   &>> %(log)s''' % locals() )
 
     print(statements)
 
@@ -196,63 +244,129 @@ def run_tsne(infiles, outfile):
 
     IOTools.touchFile(outfile) # creates sentinel file for task monitoring
 
-   
-@follows(run_tsne)
-@transform("*.tsne.RData",
-           regex(r"(.*).tsne.RData"),
-           r"\1.cluster.touch")
+
+@follows(runTsne)
+@transform("tSNE.dir/*.tsne.txt",
+           suffix(r".txt"),
+           r".load")
+def loadRunTsne(infile, outfile):
+    
+    P.load(infile, outfile)
+    
+    
+@follows(normaliseFCS, mkdir("clustering.dir"))
+@transform(normaliseFCS,
+           regex(r"data.dir/(.*).norm.txt"),
+           r"clustering.dir/\1.cluster.touch")
 def run_clustering(infile, outfile):
     '''Run clustering algorithms on tSNE dim reduced data'''
 
     job_memory = "20G"
     pipeline_dir = PARAMS["pipeline_dir"]
     
-    clust_methods = PARAMS["analysis_clust_methods"].split(",")
-    # Rphenograph, ClusterX, FlowSOM
-    
+#    clust_methods = PARAMS["clustering_methods"].split(",")
+# Phenograph only, but vary value of k (no. neighbours). Lower k = more clusters
+
     statements = []
     
-    for clust in clust_methods:
-        outname = outfile.replace(".cluster.touch", ".") + str(clust) + ".RData"
-        log = outfile.replace(".cluster.touch", ".") + str(clust) + ".log"
-
-        if clust == "Rphenograph": 
-            infile = infile.replace(".tsne.RData", ".norm.RData") # runs on high dimensionality data
-            no_clust = " "
-            print("Rphenograph")
-            
-        elif clust == "FlowSOM":
-            infile = infile.replace(".tsne.RData", ".norm.RData") # runs on high dimensionality data
-            no_clust = "--noClusters " + str(PARAMS["analysis_clust_no"])
-            print("FlowSOM")
-            
-        elif clust == "ClusterX":
-            infile = infile # run on tSNE reduced data
-            no_clust = " "
-            print("ClusterX")
-            
+    opts = [ "--k " + x for x in PARAMS["clustering_k"].split(',') ]
+    # k values from 20+ work well
+    
+    clust = "phenograph"
+    marker_list = PARAMS["clustering_markers"] # markers to use for tsne & downstream analysis
+    
+    for opt in opts:
+        if len(opt) > 1:
+            outname = outfile.replace(".cluster.touch", ".") + str(clust) + "_" + opt.split(' ')[-1] + ".txt"
+            log = outfile.replace(".cluster.touch", ".") + str(clust)  + "_" + opt.split(' ')[-1] + ".log"
         else:
-            print("Specify clustering method in pipeline.ini")
+            outname = outfile.replace(".cluster.touch", ".") + str(clust) + ".txt"
+            log = outfile.replace(".cluster.touch", ".") + str(clust) + ".log"
 
-            
-        statements.append('''Rscript %(pipeline_dir)s/R/CYTOFclust.R
+
+        statements.append('''Rscript %(pipeline_dir)sR/CYTOFclust.R
                                --infile %(infile)s
+                               --markers %(marker_list)s                                    
                                --outfile %(outname)s
-                               --clusterMethod %(clust)s
-                               %(no_clust)s
+                               %(opt)s
                                &> %(log)s''' % locals() )
-        
+
     print(statements)
     
     P.run()
 
     IOTools.touchFile(outfile)
 
+    
+@transform(run_clustering,
+           regex(r"(.*).cluster.touch"),
+           r"\1.phenograph.txt")
+def mergePhenograph(infile, outfile):
+    '''merge all phenograph runs into table for upload'''
 
-@follows(run_clustering)
-@transform("*.tsne.RData",
-           regex(r"(.*).tsne.RData"),
-           r"\1.merged.RData")
+    files = glob.glob(infile.replace(".cluster.touch", ".phenograph_*.txt"))
+
+    n = 0
+    for f in files:
+        n = n +1
+        if n == 1:
+            res = pd.read_csv(f, sep="\t")
+        else:
+            df = pd.read_csv(f, sep="\t")
+            res = pd.merge(res, df, how="inner", left_index=True, right_index=True)
+
+    res["id"] = res.index.values
+    res.to_csv(outfile, sep="\t", header=True, index=None)
+
+    
+@transform(mergePhenograph,
+           suffix(r".txt"),
+           r".load")
+def loadMergePhenograph(infile, outfile):
+
+    P.load(infile, outfile)
+
+@follows(loadMergePhenograph, mkdir("results.dir"))
+@transform("tSNE.dir/*.txt",
+           regex(r"tSNE.dir/(.*)\.([0-9]*)_([0-9]*).tsne.txt"),
+           add_inputs(r"data.dir/\1.norm.load", r"clustering.dir/\1.phenograph.txt"),
+           r"results.dir/\1.\2_\3_tsne.merged.txt")
+def mergeCYTOFresults(infiles, outfile):
+
+    db = PARAMS["database"]
+    table = os.path.basename(infiles[1]).replace(".load", "").replace(".", "_")
+    query = '''select * from %(table)s''' % locals()
+
+    fcs = DB.fetch_DataFrame(query, db)
+    tsne = pd.read_csv(infiles[0], sep="\t")
+    clust = pd.read_csv(infiles[2], sep="\t")
+
+    df = reduce(lambda left, right: pd.merge(left, right, how="inner", on="id"), [tsne, fcs, clust])
+
+    df.to_csv(outfile, sep="\t", index=False)
+
+@transform(mergeCYTOFresults,
+           suffix(".txt"),
+           r".load")
+def loadMergeCYTOFresults(infile, outfile):
+
+#    P.load(infile, outfile)
+
+    tablename = os.path.basename(outfile).replace(".load", "").replace(".", "_")
+
+    statement = '''cat %(infile)s | ''' + P.build_load_statement(tablename, retry=True) + ''' > %(outfile)s'''
+
+    print(statement)
+    
+    to_cluster = True
+
+    P.run() 
+          
+    
+@follows(run_clustering, mkdir("results.dir"))
+@transform("tSNE.dir/*.tsne.RData",
+           regex(r"tSNE.dir/(.*).tsne.RData"),
+           r"results.dir/\1.merged.RData")
 def mergeCYTOFdata(infile, outfile):
     '''merge normalised data, tsne, and clusters'''
 
@@ -260,8 +374,8 @@ def mergeCYTOFdata(infile, outfile):
     pipeline_dir = PARAMS["pipeline_dir"]
     
     # files w/ RData suffix: norm, tsne, ClusterX, Rphenograph, FlowSOM
-    sample = infile.replace(".tsne.RData", "")
-    
+    sample = "clustering.dir/" + os.path.basename(infile).split(".")[0]
+    print(sample)
     clusterx = glob.glob(sample + ".ClusterX.RData")
     if clusterx:
         clusterx = clusterx[0]
@@ -283,12 +397,17 @@ def mergeCYTOFdata(infile, outfile):
     else:
         opt_flowsom='''--FlowSOM "none" '''
 
-    statement = '''Rscript %(pipeline_dir)s/R/mergeData.R
+
+    statement = '''Rscript %(pipeline_dir)sR/mergeData.R
                      --infile %(infile)s
                      --outfile %(outfile)s
-                     %(opt_clusterx)s
                      %(opt_phenograph)s
-                     %(opt_flowsom)s''' % locals()
+                ''' % locals()
+    
+    ### No longer support clusterX and flowSOM algorithms, phenograph is better
+    
+                     # %(opt_clusterx)s
+                     # %(opt_flowsom)s
 
     print(statement)
     
@@ -297,7 +416,7 @@ def mergeCYTOFdata(infile, outfile):
     
 # ---------------------------------------------------
 # Generic pipeline tasks
-@follows(mergeCYTOFdata)
+@follows(loadNormaliseFCS, loadRunTsne, loadMergeCYTOFresults)
 def full():
     pass
 
